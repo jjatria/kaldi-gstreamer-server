@@ -1,10 +1,8 @@
-#!/bin/env perl
+#!/usr/bin/env perl
 
-use Modern::Perl '2015';
-use autodie;
-
+use Mojolicious::Lite;
+use Data::Printer;
 use Class::Load 'try_load_class';
-use AnyEvent::WebSocket::Client;
 use URI::ws;
 use Getopt::Long;
 
@@ -28,7 +26,7 @@ else {
 }
 $opt{byterate} //= 32000;
 $opt{debug}    //= 0;
-$opt{url}      //= 'ws://localhost/client/ws/speech';
+$opt{url}      //= 'ws://localhost:8890/client/ws/speech';
 $opt{url}        = URI::ws->new($opt{url});
 if (defined $opt{port}) {
   $opt{url}->port($opt{port});
@@ -40,50 +38,30 @@ else {
 my $infile  = shift or die "Usage: $0 [options] file\n";
 my $size = -s $infile;
 
-my $client = AnyEvent::WebSocket::Client->new;
+my $ua = Mojo::UserAgent->new;
 
-warn "Connecting to $opt{url}\n" if $opt{debug};
+my @final;
 
-$client->connect($opt{url})->cb(sub {
-  our $connection = eval { shift->recv };
-  if ($@) {
-    warn $@;
-    return;
-  };
+$ua->websocket("$opt{url}" => ['v1.proto'] => sub {
+  my ($ua, $tx) = @_;
+  say 'WebSocket handshake failed!' and return unless $tx->is_websocket;
+#   say 'Subprotocol negotiation failed!' and return unless $tx->protocol;
 
-  our @final;
+  $tx->on(finish => sub {
+    my ($tx, $code, $reason) = @_;
+    say "WebSocket closed with status $code.";
+  });
+  $tx->on(json => sub {
+    my ($tx, $res) = @_;
 
-  open ( my $fh, $infile ) or die "$infile: $!\n";
-  my $buffer;
-  while (read $fh, $buffer, $opt{byterate} / 4) {
-    my $msg = AnyEvent::WebSocket::Message->new(
-      body => $buffer,
-      opcode => 2,
-    );
-    $connection->send($msg);
-  }
-  warn "Audio sent, now sending EOS\n";
-  $connection->send('EOS');
-
-  $connection->on(each_message => sub {
-    my ($connection, $msg) = @_;
-
-    use JSON;
-    my $response = decode_json($msg->decoded_body);
-
-    if ($opt{debug}) {
-      use Data::Printer;
-      p $response;
-    }
-
-    if ($response->{status} == 0) {
-      my $transcript = $response->{result}->{hypotheses}->[0]->{transcript};
-      $transcript =~ s%\n%\\n%g;
+    if ($res->{status} == 0) {
+      my $transcript = $res->{result}->{hypotheses}->[0]->{transcript};
+      $transcript =~ s%\n%\\n%g if defined $transcript;
       if ($transcript) {
         local $| = 1;
         my $line;
-        if (length($transcript) > $opt{width}) {
-          my $rest = length $opt{line_prefix} - $opt{width};
+        if (length($transcript) >= $opt{width}) {
+          my $rest = length($opt{line_prefix}) - $opt{width};
           $line = sprintf("$opt{line_prefix}%s", substr($transcript, $rest));
         }
         else {
@@ -91,26 +69,26 @@ $client->connect($opt{url})->cb(sub {
         }
         print "\r", $line;
       }
-
-      if ($response->{result}->{final}) {
+# 
+      if ($res->{result}->{final}) {
         print "\r$transcript\n";
         push @final, $transcript;
       }
     }
     else {
-      warn "Received error from server (status $response->{status})\n";
-      if (defined $response->{message}) {
-        warn "Error message: ", $response->{message}, "\n";
+      warn "Received error from server (status $res->{status})\n";
+      if (defined $res->{message}) {
+        warn "Error message: ", $res->{message}, "\n";
       }
     }
   });
 
-  $connection->on(finish => sub {
-    my ($connection) = @_;
-    $connection->close;
-    print join(' ', @final), "\n";
-    exit;
-  });
+  open ( my $fh, $infile ) or die "$infile: $!\n";
+  my $buffer;
+  while (read $fh, $buffer, $opt{byterate} / 4) {
+    $tx->send({binary => $buffer});
+  }
+  warn "Audio sent, now sending EOS\n";
+  $tx->send('EOS');
 });
-
-AnyEvent->condvar->recv;
+Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
